@@ -1,3 +1,7 @@
+// MCP-webfetch — MIT License
+// Derived from opencode's webfetch tool (https://github.com/anomalyco/opencode) — MIT
+// Modifications: proxy support, MCP protocol, redirect following, JS port
+
 const http = require("http");
 const https = require("https");
 const net = require("net");
