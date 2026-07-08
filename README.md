@@ -1,10 +1,10 @@
 # MCP-webfetch
 
-通过 HTTP 代理抓取网页内容的 MCP 服务器。基于 opencode 官方 webfetch 实现，添加了代理支持。
+通过 SOCKS5 代理抓取网页内容的 MCP 服务器。基于 opencode 官方 webfetch 实现，添加了代理支持。
 
 ## 功能
 
-- 通过 `127.0.0.1:10808` HTTP 代理获取网页
+- 通过 `127.0.0.1:10808` SOCKS5 代理获取网页
 - 支持格式：markdown（默认）、text、html
 - HTML→Markdown 转换（TurndownService）
 - HTML→Text 提取（htmlparser2）
@@ -12,8 +12,6 @@
 - Cloudflare 反爬检测 + 自动重试
 - MIME 类型校验（图片/二进制自动拒绝）
 - Body 大小限制（5MB）
-- HTTP 使用 Node 内置 llhttp 解析器（C 语言，与 Node.js 同源）
-- HTTPS 通过 CONNECT 隧道 + TLS
 
 ## 安装
 
@@ -89,5 +87,7 @@ proc.stdout.on('data', (d) => { console.log(d.toString()); });
 
 ## 依赖
 
+- `effect` — 函数式运行时（HttpClient、Stream、Effect）
 - `htmlparser2` — HTML 解析（文本提取）
+- `socks-proxy-agent` — SOCKS5 代理客户端
 - `turndown` — HTML→Markdown 转换

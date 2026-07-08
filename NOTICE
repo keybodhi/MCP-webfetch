@@ -65,9 +65,7 @@ body size limiting logic.
 
 ----------------------------------------------------------------------
 Modifications from the original works:
-  - Replaced Effect framework with Node.js native http + async/await
-  - Added HTTP proxy support via CONNECT tunnel
   - Added MCP protocol layer (stdin/stdout JSON-RPC)
   - Converted TypeScript to JavaScript
+  - Added SOCKS5 proxy support via socks-proxy-agent
   - Added redirect following with loop detection
-  - Added 100 Continue handling for HTTPS parsing

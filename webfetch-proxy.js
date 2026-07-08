@@ -1,18 +1,15 @@
-// MCP-webfetch — MIT License
-// Derived from opencode's webfetch tool (https://github.com/anomalyco/opencode) — MIT
-// References Effect's HttpClient architecture (https://github.com/Effect-TS/effect) — MIT
-// Modifications: proxy support, MCP protocol, redirect following, JS port
-
-const http = require("http");
-const https = require("https");
-const net = require("net");
-const tls = require("tls");
-const readline = require("readline");
+const { Effect, Duration, Layer, Stream } = require("effect");
+const { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } = require("effect/unstable/http");
 const { Parser } = require("htmlparser2");
 const TurndownService = require("turndown");
+const http = require("http");
+const https = require("https");
+const { SocksProxyAgent } = require("socks-proxy-agent");
+const readline = require("readline");
 
 const PROXY_HOST = "127.0.0.1";
 const PROXY_PORT = 10808;
+const PROXY_URL = `socks5://${PROXY_HOST}:${PROXY_PORT}`;
 
 const name = "webfetch";
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
@@ -26,13 +23,59 @@ Use a more targeted tool when one is available. This tool is read-only. Large te
 const browserUserAgent =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
+const socksAgent = new SocksProxyAgent(PROXY_URL);
+
+async function socksFetch(input, init = {}) {
+  const url = (typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+  const mod = new URL(url).protocol === "https:" ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = mod.request(url, {
+      method: init.method || "GET",
+      headers: init.headers || {},
+      agent: socksAgent,
+      signal: init.signal,
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const body = Buffer.concat(chunks);
+        const flatHeaders = {};
+        for (const [k, v] of Object.entries(res.headers || {})) {
+          flatHeaders[k] = Array.isArray(v) ? v.join(", ") : v;
+        }
+        resolve(new Response(body, {
+          status: res.statusCode,
+          statusText: res.statusMessage,
+          headers: flatHeaders,
+        }));
+      });
+    });
+    req.on("error", reject);
+    if (init.body) {
+      if (init.body instanceof Uint8Array || init.body instanceof ArrayBuffer) {
+        req.write(Buffer.from(init.body));
+      } else if (typeof init.body === "string") {
+        req.write(init.body);
+      } else if (init.body instanceof ReadableStream) {
+        const reader = init.body.getReader();
+        const pump = () => reader.read().then(({ done, value }) => {
+          if (done) { req.end(); return; }
+          req.write(Buffer.from(value));
+          pump();
+        }).catch(reject);
+        pump();
+        return;
+      }
+    }
+    req.end();
+  });
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 
 function send(msg) {
   process.stdout.write(JSON.stringify(msg) + "\n");
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────
 
 const acceptHeader = (format) => {
   switch (format) {
@@ -46,15 +89,11 @@ const acceptHeader = (format) => {
   return "*/*";
 };
 
-const headers = (format, userAgent) => ({
+const requestHeaders = (format, userAgent) => ({
   "User-Agent": userAgent,
   Accept: acceptHeader(format),
   "Accept-Language": "en-US,en;q=0.9",
 });
-
-const assertHttpUrl = (url) => {
-  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("URL must use http:// or https://");
-};
 
 const mimeFrom = (contentType) => contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
 const isImageAttachment = (mime) => mime.startsWith("image/") && mime !== "image/svg+xml" && mime !== "image/vnd.fastbidsheet";
@@ -75,243 +114,106 @@ const convert = (content, contentType, format) => {
   return content;
 };
 
-// ── Cloudflare detection ──────────────────────────────────────────────────
-
 const isCloudflareChallenge = (error) => {
   if (!error || typeof error !== "object" || !("reason" in error)) return false;
   const reason = error.reason;
   if (
-    !reason ||
-    typeof reason !== "object" ||
-    !("_tag" in reason) ||
-    reason._tag !== "StatusCodeError" ||
+    !reason || typeof reason !== "object" ||
+    !("_tag" in reason) || reason._tag !== "StatusCodeError" ||
     !("response" in reason)
-  )
-    return false;
+  ) return false;
   const response = reason.response;
   return response.status === 403 && response.headers["cf-mitigated"] === "challenge";
 };
 
-// ── Body collector ────────────────────────────────────────────────────────
+const oversizedError = () => new Error(`Response too large (exceeds ${MAX_RESPONSE_BYTES} byte limit)`);
 
-const collectBoundedResponseBody = (responseBody, resHeaders) => {
-  const contentLength = resHeaders["content-length"];
-  const parsedSize = contentLength ? Number.parseInt(contentLength, 10) : undefined;
-  const declaredSize =
-    parsedSize !== undefined && Number.isSafeInteger(parsedSize) && parsedSize >= 0 ? parsedSize : undefined;
-  if (declaredSize !== undefined && declaredSize > MAX_RESPONSE_BYTES) {
-    throw new Error(`Response too large (exceeds ${MAX_RESPONSE_BYTES} byte limit)`);
-  }
-  if (responseBody.length > MAX_RESPONSE_BYTES) {
-    throw new Error(`Response too large (exceeds ${MAX_RESPONSE_BYTES} byte limit)`);
-  }
-  return responseBody;
-};
-
-// ── HTTP via proxy: uses Node's llhttp C parser ───────────────────────────
-
-const executeHttp = (urlString, format, userAgent, timeoutSeconds) =>
-  new Promise((resolve, reject) => {
-    const h = headers(format, userAgent);
-    const req = http.request({
-      host: PROXY_HOST,
-      port: PROXY_PORT,
-      path: urlString,
-      method: "GET",
-      headers: { ...h, Host: new URL(urlString).hostname },
-      timeout: (timeoutSeconds || DEFAULT_TIMEOUT_SECONDS) * 1000,
-    });
-    req.on("response", (res) => {
-      let body = Buffer.alloc(0);
-      res.on("data", (chunk) => { body = Buffer.concat([body, chunk]); });
-      res.on("end", () => {
-        resolve({ statusCode: res.statusCode, headers: res.headers, body });
-      });
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Request timed out")); });
-    req.end();
-  });
-
-// ── HTTPS via proxy: CONNECT tunnel + TLS ─────────────────────────────────
-
-const executeHttps = (urlString, format, userAgent, timeoutSeconds) =>
-  new Promise((resolve, reject) => {
-    const parsed = new URL(urlString);
-    const socket = net.connect(PROXY_PORT, PROXY_HOST, () => {
-      socket.write(`CONNECT ${parsed.hostname}:${parsed.port || 443} HTTP/1.1\r\nHost: ${parsed.hostname}:${parsed.port || 443}\r\n\r\n`);
-    });
-    let proxyBuf = "";
-    const onData = (data) => {
-      proxyBuf += data.toString();
-      const idx = proxyBuf.indexOf("\r\n\r\n");
-      if (idx === -1) return;
-      socket.removeAllListeners("data");
-      const statusLine = proxyBuf.slice(0, proxyBuf.indexOf("\r\n"));
-      if (!statusLine.includes("200")) {
-        socket.destroy();
-        return reject(new Error("CONNECT failed: " + statusLine));
-      }
-      const leftover = proxyBuf.slice(idx + 4);
-      if (leftover.length > 0) socket.unshift(Buffer.from(leftover, "utf-8"));
-      const tlsSocket = tls.connect({ socket, servername: parsed.hostname });
-      tlsSocket.on("secureConnect", () => {
-        const h = headers(format, userAgent);
-        tlsSocket.write(
-          `GET ${parsed.pathname + parsed.search} HTTP/1.1\r\n` +
-          `Host: ${parsed.hostname}\r\n` +
-          `User-Agent: ${h["User-Agent"]}\r\n` +
-          `Accept: ${h.Accept}\r\n` +
-          `Accept-Language: ${h["Accept-Language"]}\r\n` +
-          `Connection: close\r\n\r\n`
-        );
-        let raw = Buffer.alloc(0);
-        tlsSocket.on("data", (chunk) => { raw = Buffer.concat([raw, chunk]); });
-        tlsSocket.on("end", () => processRawHttps(raw, resolve, reject));
-      });
-      tlsSocket.on("error", reject);
-      tlsSocket.setTimeout(30000, () => { tlsSocket.destroy(); reject(new Error("TLS timeout")); });
-    };
-    socket.on("data", onData);
-    socket.on("error", reject);
-    socket.setTimeout(30000, () => { socket.destroy(); reject(new Error("CONNECT timeout")); });
-  });
-
-function processRawHttps(raw, resolve, reject) {
-  if (raw.length === 0) return reject(new Error("Empty response"));
-  try {
-    const idx = raw.indexOf("\r\n\r\n");
-    if (idx === -1) return reject(new Error("Incomplete HTTP response"));
-    const headerStr = raw.subarray(0, idx).toString();
-    const body = raw.subarray(idx + 4);
-    const statusMatch = headerStr.match(/^HTTP\/\d\.\d\s+(\d+)(?:\s+(.*))?$/m);
-    if (!statusMatch) return reject(new Error("Malformed status line"));
-    const statusCode = parseInt(statusMatch[1], 10);
-
-    // Skip interim 1xx responses (e.g. 100 Continue)
-    if (statusCode >= 100 && statusCode < 200) {
-      return processRawHttps(body, resolve, reject);
-    }
-
-    const lines = headerStr.split("\r\n");
-    const resHeaders = {};
-    for (let i = 1; i < lines.length; i++) {
-      if (/^[ \t]/.test(lines[i])) {
-        const k = Object.keys(resHeaders).pop();
-        if (k) resHeaders[k] += " " + lines[i].trim();
-        continue;
-      }
-      const m = lines[i].match(/^([^:]+):\s*(.*)/);
-      if (!m) continue;
-      const key = m[1].toLowerCase();
-      const val = m[2].trim();
-      if (key === "set-cookie") resHeaders[key] = resHeaders[key] ? [].concat(resHeaders[key], val) : val;
-      else resHeaders[key] = val;
-    }
-    const isChunked = (resHeaders["transfer-encoding"] || "").toLowerCase().split(",").map(s => s.trim()).includes("chunked");
-    let decoded = isChunked ? decodeChunkedBody(body) : body;
-
-    // Consume chunked trailers (headers after last chunk)
-    if (isChunked && decoded.length > 0) {
-      const trailerIdx = decoded.indexOf("\r\n\r\n");
-      if (trailerIdx !== -1) {
-        decoded = decoded.subarray(trailerIdx + 4);
-      }
-    }
-
-    resolve({ statusCode, headers: resHeaders, body: decoded });
-  } catch (e) {
-    reject(e);
-  }
-}
-
-function decodeChunkedBody(data) {
-  const chunks = [];
-  let pos = 0;
-  while (pos < data.length) {
-    const crlf = data.indexOf("\r\n", pos);
-    if (crlf === -1) break;
-    const sizeStr = data.subarray(pos, crlf).toString("utf-8").trim();
-    const size = parseInt(sizeStr, 16);
-    if (isNaN(size)) break;
-    pos = crlf + 2;
-    if (size === 0) break;
-    if (pos + size > data.length) break;
-    chunks.push(data.subarray(pos, pos + size));
-    pos += size + 2;
-  }
-  return Buffer.concat(chunks);
-}
-
-// ── Process response (MIME checks → collect body → decode → convert) ─────
-
-const processResponse = ({ statusCode, headers, body }, format) => {
-  const contentType = headers["content-type"] || "";
-  const mime = mimeFrom(contentType);
-
-  if (statusCode === 403 && headers["cf-mitigated"] === "challenge") {
-    const challenge = new Error("Cloudflare challenge");
-    challenge.reason = { _tag: "StatusCodeError", response: { status: 403, headers: { "cf-mitigated": "challenge" } } };
-    throw challenge;
-  }
-
-  if (isImageAttachment(mime)) throw new Error("Unsupported fetched image content type: " + mime);
-  if (!isTextualMime(mime)) throw new Error("Unsupported fetched file content type: " + mime);
-
-  const rawBody = collectBoundedResponseBody(body, headers);
-  const content = new TextDecoder().decode(rawBody);
-  const output = convert(content, contentType, format);
-  return { output, contentType, statusCode, headers };
-};
-
-// ── Main fetch ────────────────────────────────────────────────────────────
-
-const fetchUrl = async (urlString, format, timeoutSeconds, seen) => {
-  const parsed = new URL(urlString);
-  assertHttpUrl(parsed);
-  if (seen.has(urlString)) throw new Error("Redirect loop");
-  seen.add(urlString);
-
-  const isHttps = parsed.protocol === "https:";
-  const execute = isHttps ? executeHttps : executeHttp;
-  const ua = browserUserAgent;
-
-  let result;
-  try {
-    result = await withTimeout(execute(urlString, format, ua, timeoutSeconds), (timeoutSeconds || DEFAULT_TIMEOUT_SECONDS) * 1000 + 5000, "Request timed out");
-  } catch (e) {
-    if (isCloudflareChallenge(e)) {
-      result = await withTimeout(execute(urlString, format, "opencode", timeoutSeconds), (timeoutSeconds || DEFAULT_TIMEOUT_SECONDS) * 1000 + 5000, "Request timed out");
-    } else {
-      throw e;
-    }
-  }
-
-  const processed = processResponse(result, format);
-  const { statusCode, headers, output, contentType } = processed;
-
-  if (statusCode >= 300 && statusCode < 400) {
-    const loc = headers["location"];
-    if (loc) {
-      const nextUrl = new URL(loc, urlString).href;
-      if (seen.has(nextUrl)) throw new Error("Redirect loop");
-      return fetchUrl(nextUrl, format, timeoutSeconds, seen);
-    }
-  }
-
-  return { output, contentType };
-};
-
-const withTimeout = (promise, ms, message) =>
-  new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); },
+const collectBoundedBody = (response, maximumBytes, tooLarge) =>
+  Effect.gen(function* () {
+    const contentLength = response.headers["content-length"];
+    const parsedSize = contentLength ? Number.parseInt(contentLength, 10) : undefined;
+    const declaredSize = parsedSize !== undefined && Number.isSafeInteger(parsedSize) && parsedSize >= 0 ? parsedSize : undefined;
+    if (declaredSize !== undefined && declaredSize > maximumBytes) return yield* Effect.fail(tooLarge());
+    let body = Buffer.allocUnsafe(Math.min(maximumBytes, declaredSize || 64 * 1024));
+    let size = 0;
+    yield* Stream.runForEach(
+      response.stream,
+      (chunk) => {
+        if (chunk.byteLength === 0) return Effect.void;
+        if (size + chunk.byteLength > maximumBytes) return Effect.fail(tooLarge());
+        if (size + chunk.byteLength > body.byteLength) {
+          const grown = Buffer.allocUnsafe(Math.min(maximumBytes, Math.max(size + chunk.byteLength, body.byteLength * 2)));
+          body.copy(grown, 0, 0, size);
+          body = grown;
+        }
+        body.set(chunk, size);
+        size += chunk.byteLength;
+        return Effect.void;
+      },
     );
+    return body.subarray(0, size);
   });
 
-// ── extractTextFromHTML (htmlparser2 with skipDepth) ──────────────────────
+const execute = (http, urlString, format, userAgent) =>
+  http.execute(
+    HttpClientRequest.get(urlString).pipe(
+      HttpClientRequest.setHeaders(requestHeaders(format, userAgent)),
+    ),
+  );
+
+const fetchUrl = (urlString, format, timeoutSeconds) =>
+  Effect.gen(function* () {
+    const http = yield* HttpClient.HttpClient;
+    const httpFollow = HttpClient.followRedirects(http, 10);
+
+    const result = yield* Effect.gen(function* () {
+      const response = yield* execute(httpFollow, urlString, format, browserUserAgent).pipe(
+        Effect.flatMap(HttpClientResponse.filterStatusOk),
+        Effect.catchIf(
+          isCloudflareChallenge,
+          () => execute(httpFollow, urlString, format, "opencode").pipe(
+            Effect.flatMap(HttpClientResponse.filterStatusOk),
+          ),
+        ),
+      );
+
+      const contentType = response.headers["content-type"] || "";
+      const mime = mimeFrom(contentType);
+
+      if (isImageAttachment(mime)) {
+        const body = yield* collectBoundedBody(response, MAX_RESPONSE_BYTES, oversizedError);
+        return { imageData: body, contentType, isImage: true };
+      }
+
+      if (!isTextualMime(mime)) {
+        return yield* Effect.fail(new Error(`Unsupported fetched file content type: ${mime}`));
+      }
+
+      const body = yield* collectBoundedBody(response, MAX_RESPONSE_BYTES, oversizedError);
+      const content = new TextDecoder().decode(body);
+      const output = yield* Effect.try({
+        try: () => convert(content, contentType, format),
+        catch: (error) => error,
+      });
+      return { output, contentType };
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: Duration.seconds(timeoutSeconds),
+        orElse: () => Effect.fail(new Error("Request timed out")),
+      }),
+    );
+
+    return result;
+  }).pipe(
+    Effect.mapError(() => new Error(`Unable to fetch ${urlString}`)),
+  );
+
+const socksLayer = Layer.effect(
+  FetchHttpClient.Fetch,
+  Effect.sync(() => socksFetch),
+);
+
+const appLayer = Layer.merge(FetchHttpClient.layer, socksLayer);
 
 function extractTextFromHTML(html) {
   let text = "";
@@ -332,28 +234,22 @@ function extractTextFromHTML(html) {
   return text.trim();
 }
 
-// ── convertHTMLToMarkdown (TurndownService) ───────────────────────────────
-
-const turndown = new TurndownService({
-  headingStyle: "atx",
-  hr: "---",
-  bulletListMarker: "-",
-  codeBlockStyle: "fenced",
-  emDelimiter: "*",
-});
-
-turndown.remove(["script", "style", "meta", "link"]);
-
 function convertHTMLToMarkdown(html) {
+  const turndown = new TurndownService({
+    headingStyle: "atx",
+    hr: "---",
+    bulletListMarker: "-",
+    codeBlockStyle: "fenced",
+    emDelimiter: "*",
+  });
+  turndown.remove(["script", "style", "meta", "link"]);
   return turndown.turndown(html);
 }
-
-// ── MCP handlers ─────────────────────────────────────────────────────────
 
 rl.on("line", async (line) => {
   let msg;
   try {
-    msg = JSON.parse(line);
+    msg = JSON.parse(line.replace(/^\uFEFF/, ""));
   } catch {
     return;
   }
@@ -427,21 +323,34 @@ rl.on("line", async (line) => {
         break;
       }
       try {
-        assertHttpUrl(new URL(url));
+        const parsed = new URL(url);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error();
       } catch {
         send({ jsonrpc: "2.0", id, error: { code: -32602, message: "URL must use http:// or https://" } });
         break;
       }
-      const safeTimeout = typeof timeout === "number" && timeout > 0
-        ? Math.min(timeout, MAX_TIMEOUT_SECONDS)
-        : DEFAULT_TIMEOUT_SECONDS;
+      if (timeout !== undefined && (typeof timeout !== "number" || timeout <= 0 || timeout > MAX_TIMEOUT_SECONDS)) {
+        send({ jsonrpc: "2.0", id, error: { code: -32602, message: `timeout must be a number between 1 and ${MAX_TIMEOUT_SECONDS}` } });
+        break;
+      }
+      const safeTimeout = typeof timeout === "number" ? timeout : DEFAULT_TIMEOUT_SECONDS;
       try {
-        const result = await fetchUrl(url, format, safeTimeout, new Set());
-        send({
-          jsonrpc: "2.0",
-          id,
-          result: { content: [{ type: "text", text: result.output }] },
-        });
+        const result = await Effect.runPromise(
+          Effect.provide(fetchUrl(url, format, safeTimeout), appLayer),
+        );
+        if (result.isImage) {
+          send({
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "image", data: result.imageData.toString("base64"), mimeType: result.contentType }] },
+          });
+        } else {
+          send({
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: result.output }] },
+          });
+        }
       } catch (e) {
         send({
           jsonrpc: "2.0",

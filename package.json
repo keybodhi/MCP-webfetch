@@ -1,17 +1,19 @@
 {
-  "name": "mcp",
+  "name": "mcp-webfetch",
   "version": "1.0.0",
-  "description": "",
+  "description": "MCP server for fetching web content through SOCKS5 proxy",
   "main": "webfetch-proxy.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
+    "effect": "^4.0.0-beta.94",
     "htmlparser2": "^12.0.0",
+    "socks-proxy-agent": "^10.1.0",
     "turndown": "^7.2.4"
   }
 }
