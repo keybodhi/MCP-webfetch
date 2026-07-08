@@ -1,12 +1,12 @@
 MCP-webfetch
 Copyright (c) 2026
 
-This project incorporates code derived from opencode's webfetch tool
-(https://github.com/anomalyco/opencode), which is licensed as follows:
+This project incorporates code and logic derived from the following projects:
 
 ----------------------------------------------------------------------
-MIT License
+1. opencode's webfetch tool (https://github.com/anomalyco/opencode)
 
+MIT License
 Copyright (c) 2025 opencode
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -34,9 +34,40 @@ Derived functions from opencode's webfetch.ts:
   - collectBoundedResponseBody
   - description text and constant definitions
 
-Modifications from the original:
+----------------------------------------------------------------------
+2. Effect (https://github.com/Effect-TS/effect)
+
+MIT License
+Copyright (c) 2023 Effectful Technologies Inc
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+----------------------------------------------------------------------
+
+Effect's HttpClient architecture and collectBoundedResponseBody
+implementation were used as reference for the HTTP request flow and
+body size limiting logic.
+
+----------------------------------------------------------------------
+Modifications from the original works:
   - Replaced Effect framework with Node.js native http + async/await
   - Added HTTP proxy support via CONNECT tunnel
   - Added MCP protocol layer (stdin/stdout JSON-RPC)
   - Converted TypeScript to JavaScript
   - Added redirect following with loop detection
+  - Added 100 Continue handling for HTTPS parsing
