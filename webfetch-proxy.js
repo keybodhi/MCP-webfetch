@@ -1,5 +1,6 @@
 // MCP-webfetch — MIT License
 // Derived from opencode's webfetch tool (https://github.com/anomalyco/opencode) — MIT
+// References Effect's HttpClient architecture (https://github.com/Effect-TS/effect) — MIT
 // Modifications: proxy support, MCP protocol, redirect following, JS port
 
 const http = require("http");
