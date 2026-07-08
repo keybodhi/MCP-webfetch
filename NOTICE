@@ -3,7 +3,7 @@ Copyright (c) 2026
 
 This project is a derivative work of opencode's webfetch tool,
 which is part of the opencode project (https://github.com/anomalyco/opencode)
-licensed under the Apache License, Version 2.0.
+licensed under the MIT License (Copyright (c) 2025 opencode).
 
 The following functions are derived from opencode's webfetch.ts:
   - acceptHeader, headers, mimeFrom, isImageAttachment, isTextualMime
